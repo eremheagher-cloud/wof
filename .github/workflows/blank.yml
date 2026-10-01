@@ -1,0 +1,768 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+    inputs:
+      instance_number:
+        description: 'Instance Number (1-10)'
+        required: true
+        default: '1'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  deploy-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Prepare Windows Like a New PC
+      shell: powershell
+      run: |
+        Write-Host "Preparing Windows environment..."
+
+        Set-ExecutionPolicy `
+          -ExecutionPolicy Bypass `
+          -Scope LocalMachine `
+          -Force `
+          -ErrorAction SilentlyContinue
+
+        New-Item `
+          -ItemType Directory `
+          -Path "C:\PC-State" `
+          -Force |
+          Out-Null
+
+        Write-Host "Windows environment prepared."
+
+    - name: System Information
+      shell: powershell
+      run: |
+        $os = Get-CimInstance Win32_OperatingSystem
+
+        Write-Host "System information:"
+        Write-Host "Computer: $env:COMPUTERNAME"
+        Write-Host "User: $env:USERNAME"
+        Write-Host "OS: $($os.Caption)"
+        Write-Host "Version: $($os.Version)"
+
+    - name: Prepare WinGet
+      shell: powershell
+      run: |
+        Write-Host "Preparing WinGet..."
+
+        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+        if ($null -ne $winget) {
+          Write-Host "WinGet is available."
+          winget --version
+        }
+        else {
+          Write-Host "WinGet is not available on this runner." -ForegroundColor Yellow
+        }
+
+    - name: Restore Saved PC State
+      shell: powershell
+      run: |
+        $statePath = ".pc-state\state.json"
+
+        if (-not (Test-Path -LiteralPath $statePath)) {
+          Write-Host "No previous PC state found."
+          exit 0
+        }
+
+        Write-Host "Loading previous PC state..."
+
+        try {
+          $state = Get-Content `
+            -LiteralPath $statePath `
+            -Raw |
+            ConvertFrom-Json
+
+          Write-Host "Previous state loaded."
+        }
+        catch {
+          Write-Host "Could not read previous state." -ForegroundColor Yellow
+          exit 0
+        }
+
+        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+        if ($null -eq $winget) {
+          Write-Host "WinGet is unavailable. Skipping application restore." -ForegroundColor Yellow
+          exit 0
+        }
+
+        if ($null -eq $state.Applications) {
+          Write-Host "No saved applications found."
+          exit 0
+        }
+
+        foreach ($application in $state.Applications) {
+
+          $name = [string]$application.Name
+          $wingetId = [string]$application.WingetId
+
+          if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+          }
+
+          if ([string]::IsNullOrWhiteSpace($wingetId)) {
+            Write-Host "No WinGet ID for: $name" -ForegroundColor Yellow
+            continue
+          }
+
+          Write-Host "Checking application: $name"
+
+          try {
+
+            winget list `
+              --id "$wingetId" `
+              --exact `
+              --accept-source-agreements `
+              --disable-interactivity 2>$null
+
+            if ($LASTEXITCODE -eq 0) {
+
+              Write-Host "$name is already installed."
+
+            }
+            else {
+
+              Write-Host "Installing: $name"
+
+              winget install `
+                --id "$wingetId" `
+                --exact `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --silent `
+                --disable-interactivity
+
+              if ($LASTEXITCODE -eq 0) {
+                Write-Host "$name installed successfully."
+              }
+              else {
+                Write-Host "Could not install $name." -ForegroundColor Yellow
+              }
+            }
+          }
+          catch {
+            Write-Host "Error restoring $name." -ForegroundColor Yellow
+          }
+        }
+
+    - name: Update Windows Server 2022
+      shell: powershell
+      run: |
+        Write-Host "Checking Windows updates..."
+
+        try {
+          [Net.ServicePointManager]::SecurityProtocol =
+            [Net.SecurityProtocolType]::Tls12
+        }
+        catch {
+        }
+
+        try {
+          Install-PackageProvider `
+            -Name NuGet `
+            -MinimumVersion 2.8.5.201 `
+            -Force `
+            -ErrorAction Stop
+
+          Write-Host "NuGet provider installed."
+        }
+        catch {
+          Write-Host "NuGet provider installation failed. Continuing." -ForegroundColor Yellow
+        }
+
+        try {
+          Install-Module `
+            -Name PSWindowsUpdate `
+            -Force `
+            -AllowClobber `
+            -ErrorAction Stop
+
+          Import-Module PSWindowsUpdate -ErrorAction Stop
+
+          Write-Host "PSWindowsUpdate loaded."
+
+          try {
+            Install-WindowsUpdate `
+              -MicrosoftUpdate `
+              -AcceptAll `
+              -IgnoreReboot `
+              -ErrorAction Continue
+          }
+          catch {
+            Write-Host "Windows Update returned an error. Continuing." -ForegroundColor Yellow
+          }
+        }
+        catch {
+          Write-Host "PSWindowsUpdate could not be installed. Continuing." -ForegroundColor Yellow
+        }
+
+    - name: Enable RDP
+      shell: powershell
+      run: |
+        Write-Host "Enabling Remote Desktop..."
+
+        Set-ItemProperty `
+          -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+          -Name "fDenyTSConnections" `
+          -Value 0 `
+          -Force
+
+        Set-ItemProperty `
+          -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+          -Name "UserAuthentication" `
+          -Value 0 `
+          -Force
+
+        Enable-NetFirewallRule `
+          -DisplayGroup "Remote Desktop" `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "RDP enabled."
+
+    - name: Create User Account
+      shell: powershell
+      run: |
+        $username = "Rafael"
+        $passwordText = "P@ssw0rd!"
+
+        Write-Host "Configuring user account..."
+
+        $securePassword = ConvertTo-SecureString `
+          $passwordText `
+          -AsPlainText `
+          -Force
+
+        $existingUser = Get-LocalUser `
+          -Name $username `
+          -ErrorAction SilentlyContinue
+
+        if ($null -eq $existingUser) {
+
+          New-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -FullName "Rafael" `
+            -Description "RDP User" `
+            -PasswordNeverExpires `
+            -UserMayNotChangePassword `
+            -ErrorAction Stop
+
+          Write-Host "User created."
+        }
+        else {
+
+          Set-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "User already exists."
+        }
+
+        Add-LocalGroupMember `
+          -Group "Administrators" `
+          -Member $username `
+          -ErrorAction SilentlyContinue
+
+        Add-LocalGroupMember `
+          -Group "Remote Desktop Users" `
+          -Member $username `
+          -ErrorAction SilentlyContinue
+
+        Write-Host "User permissions configured."
+
+    - name: Fix Windows Audio
+      shell: powershell
+      run: |
+        Write-Host "Configuring Windows Audio..."
+
+        $audioServices = @(
+          "Audiosrv",
+          "AudioEndpointBuilder"
+        )
+
+        foreach ($serviceName in $audioServices) {
+
+          $service = Get-Service `
+            -Name $serviceName `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $service) {
+            continue
+          }
+
+          try {
+
+            Set-Service `
+              -Name $serviceName `
+              -StartupType Automatic `
+              -ErrorAction SilentlyContinue
+
+            Start-Service `
+              -Name $serviceName `
+              -ErrorAction SilentlyContinue
+          }
+          catch {
+            Write-Host "Could not start $serviceName." -ForegroundColor Yellow
+          }
+        }
+
+        Write-Host "Audio configuration completed."
+
+    - name: Configure Network
+      shell: powershell
+      run: |
+        Write-Host "Configuring network..."
+
+        try {
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+        }
+        catch {
+        }
+
+        Write-Host "Network configuration completed."
+
+    - name: Install Tailscale
+      shell: powershell
+      run: |
+        $installer = "$env:TEMP\tailscale-setup.msi"
+        $tailscaleUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+
+        Write-Host "Downloading Tailscale..."
+
+        Invoke-WebRequest `
+          -Uri $tailscaleUrl `
+          -OutFile $installer `
+          -UseBasicParsing
+
+        Write-Host "Installing Tailscale..."
+
+        Start-Process `
+          -FilePath "msiexec.exe" `
+          -ArgumentList "/i `"$installer`" /qn /norestart" `
+          -Wait `
+          -NoNewWindow
+
+        Write-Host "Tailscale installed."
+
+    - name: Start Tailscale
+      shell: powershell
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+        if (-not (Test-Path -LiteralPath $tailscale)) {
+          $tailscale = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+        }
+
+        if (-not (Test-Path -LiteralPath $tailscale)) {
+          Write-Host "Tailscale executable was not found." -ForegroundColor Red
+          exit 1
+        }
+
+        $authKey = $env:TAILSCALE_AUTH_KEY
+
+        if ([string]::IsNullOrWhiteSpace($authKey)) {
+          Write-Host "TAILSCALE_AUTH_KEY is missing." -ForegroundColor Red
+          exit 1
+        }
+
+        $hostname = "enigmano-${{ github.run_id }}"
+
+        Write-Host "Connecting Tailscale..."
+
+        & $tailscale up `
+          "--authkey=$authKey" `
+          "--hostname=$hostname"
+
+        if ($LASTEXITCODE -ne 0) {
+          Write-Host "Tailscale connection failed." -ForegroundColor Red
+          exit $LASTEXITCODE
+        }
+
+        Write-Host "Tailscale connected."
+
+    - name: Get Tailscale IP
+      shell: powershell
+      run: |
+        $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+        if (-not (Test-Path -LiteralPath $tailscale)) {
+          $tailscale = "${env:ProgramFiles(x86)}\Tailscale\tailscale.exe"
+        }
+
+        if (-not (Test-Path -LiteralPath $tailscale)) {
+          Write-Host "Tailscale executable not found." -ForegroundColor Red
+          exit 1
+        }
+
+        $ip = & $tailscale ip -4 2>$null |
+          Select-Object -First 1
+
+        if ([string]::IsNullOrWhiteSpace($ip)) {
+          Write-Host "Could not obtain Tailscale IPv4." -ForegroundColor Red
+          exit 1
+        }
+
+        Write-Host "Tailscale IPv4: $ip"
+
+        "TAILSCALE_IP=$ip" |
+          Out-File `
+            -FilePath $env:GITHUB_ENV `
+            -Append `
+            -Encoding utf8
+
+    - name: Install Google Chrome
+      shell: powershell
+      run: |
+        Write-Host "Installing Google Chrome..."
+
+        $chromeUrl = "https://dl.google.com/chrome/install/latest/chrome_installer.exe"
+        $chromeInstaller = "$env:TEMP\chrome_installer.exe"
+
+        try {
+
+          Invoke-WebRequest `
+            -Uri $chromeUrl `
+            -OutFile $chromeInstaller `
+            -UseBasicParsing
+
+          Start-Process `
+            -FilePath $chromeInstaller `
+            -ArgumentList "/silent", "/install" `
+            -Wait `
+            -NoNewWindow
+
+          Write-Host "Google Chrome installed."
+        }
+        catch {
+          Write-Host "Chrome installation failed." -ForegroundColor Yellow
+        }
+
+    - name: Install 7-Zip
+      shell: powershell
+      run: |
+        Write-Host "Installing 7-Zip..."
+
+        $sevenZipUrl = "https://www.7-zip.org/a/7z2409-x64.exe"
+        $sevenZipInstaller = "$env:TEMP\7zip.exe"
+
+        try {
+
+          Invoke-WebRequest `
+            -Uri $sevenZipUrl `
+            -OutFile $sevenZipInstaller `
+            -UseBasicParsing
+
+          Start-Process `
+            -FilePath $sevenZipInstaller `
+            -ArgumentList "/S" `
+            -Wait `
+            -NoNewWindow
+
+          Write-Host "7-Zip installed."
+        }
+        catch {
+          Write-Host "7-Zip installation failed." -ForegroundColor Yellow
+        }
+
+    - name: Detect User Installed Applications
+      shell: powershell
+      run: |
+        Write-Host "Detecting installed applications..."
+
+        $stateDirectory = ".pc-state"
+        $statePath = ".pc-state\state.json"
+
+        if (-not (Test-Path -LiteralPath $stateDirectory)) {
+          New-Item `
+            -ItemType Directory `
+            -Path $stateDirectory `
+            -Force |
+            Out-Null
+        }
+
+        $oldState = $null
+
+        if (Test-Path -LiteralPath $statePath) {
+
+          try {
+
+            $oldState = Get-Content `
+              -LiteralPath $statePath `
+              -Raw |
+              ConvertFrom-Json
+
+            Write-Host "Previous PC state loaded."
+          }
+          catch {
+
+            Write-Host "Could not load previous PC state." -ForegroundColor Yellow
+            $oldState = $null
+          }
+        }
+
+        $registryPaths = @(
+          "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
+          "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*",
+          "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*"
+        )
+
+        $applications = @()
+
+        foreach ($registryPath in $registryPaths) {
+
+          $items = Get-ItemProperty `
+            -Path $registryPath `
+            -ErrorAction SilentlyContinue
+
+          foreach ($item in $items) {
+
+            $displayName = [string]$item.DisplayName
+
+            if ([string]::IsNullOrWhiteSpace($displayName)) {
+              continue
+            }
+
+            $applications += [PSCustomObject]@{
+              Name = $displayName
+              Version = [string]$item.DisplayVersion
+              Publisher = [string]$item.Publisher
+              InstallLocation = [string]$item.InstallLocation
+              WingetId = ""
+            }
+          }
+        }
+
+        $applications = @(
+          $applications |
+          Sort-Object Name, Version -Unique
+        )
+
+        Write-Host "Applications detected: $($applications.Count)"
+
+        $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+        if ($null -ne $winget) {
+
+          Write-Host "WinGet detected."
+
+          foreach ($application in $applications) {
+
+            if ([string]::IsNullOrWhiteSpace($application.Name)) {
+              continue
+            }
+
+            try {
+
+              $searchOutput = winget search `
+                --name "$($application.Name)" `
+                --exact `
+                --accept-source-agreements `
+                --disable-interactivity 2>$null
+
+              if (
+                $LASTEXITCODE -eq 0 -and
+                $null -ne $searchOutput
+              ) {
+
+                foreach ($line in $searchOutput) {
+
+                  $lineText = [string]$line
+
+                  if ($lineText -match '^\s*(\S+)\s+(\S+)\s+') {
+
+                    $possibleId = $Matches[2]
+
+                    if (
+                      -not [string]::IsNullOrWhiteSpace($possibleId) -and
+                      $possibleId -ne "Id"
+                    ) {
+
+                      $application.WingetId = $possibleId
+                      break
+                    }
+                  }
+                }
+              }
+            }
+            catch {
+
+              Write-Host `
+                "WinGet search failed for $($application.Name)." `
+                -ForegroundColor Yellow
+            }
+          }
+        }
+        else {
+
+          Write-Host "WinGet is not available." -ForegroundColor Yellow
+        }
+
+        if ($null -ne $oldState) {
+
+          if ($null -ne $oldState.Applications) {
+
+            foreach ($oldApplication in $oldState.Applications) {
+
+              $oldName = [string]$oldApplication.Name
+
+              if ([string]::IsNullOrWhiteSpace($oldName)) {
+                continue
+              }
+
+              $found = $false
+
+              foreach ($application in $applications) {
+
+                if ($application.Name -eq $oldName) {
+
+                  $found = $true
+
+                  if (
+                    [string]::IsNullOrWhiteSpace(
+                      [string]$application.WingetId
+                    )
+                  ) {
+
+                    $oldWingetId = [string]$oldApplication.WingetId
+
+                    if (
+                      -not [string]::IsNullOrWhiteSpace($oldWingetId)
+                    ) {
+
+                      $application.WingetId = $oldWingetId
+                    }
+                  }
+
+                  break
+                }
+              }
+
+              if (-not $found) {
+
+                $applications += [PSCustomObject]@{
+                  Name = $oldName
+                  Version = [string]$oldApplication.Version
+                  Publisher = [string]$oldApplication.Publisher
+                  InstallLocation = [string]$oldApplication.InstallLocation
+                  WingetId = [string]$oldApplication.WingetId
+                }
+
+                Write-Host "Saved application retained: $oldName"
+              }
+            }
+          }
+        }
+
+        $serviceNames = @(
+          "Audiosrv",
+          "AudioEndpointBuilder",
+          "Dhcp",
+          "Dnscache",
+          "NlaSvc",
+          "netprofm",
+          "TermService",
+          "Tailscale"
+        )
+
+        $services = @()
+
+        foreach ($serviceName in $serviceNames) {
+
+          $service = Get-CimInstance `
+            -ClassName Win32_Service `
+            -Filter "Name='$serviceName'" `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $service) {
+            continue
+          }
+
+          $startType = "Manual"
+
+          if ($service.StartMode -eq "Auto") {
+            $startType = "Automatic"
+          }
+          elseif ($service.StartMode -eq "Disabled") {
+            $startType = "Disabled"
+          }
+
+          $services += [PSCustomObject]@{
+            Name = $service.Name
+            Status = $service.State
+            StartType = $startType
+          }
+        }
+
+        $rdpValue = Get-ItemPropertyValue `
+          -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+          -Name "fDenyTSConnections" `
+          -ErrorAction SilentlyContinue
+
+        $rdpEnabled = ($rdpValue -eq 0)
+
+        $state = [PSCustomObject]@{
+          Version = 3
+          SavedAt = (Get-Date).ToUniversalTime().ToString("o")
+          LastRunner = $env:RUNNER_NAME
+          Applications = @($applications)
+          Services = @($services)
+          Settings = [PSCustomObject]@{
+            RDPEnabled = $rdpEnabled
+          }
+          Security = [PSCustomObject]@{
+            PasswordsSaved = $false
+            BrowserCookiesSaved = $false
+            AuthenticationTokensSaved = $false
+          }
+        }
+
+        try {
+
+          $json = $state |
+            ConvertTo-Json -Depth 15
+
+          Set-Content `
+            -LiteralPath $statePath `
+            -Value $json `
+            -Encoding UTF8
+
+          Write-Host "PC state saved successfully."
+        }
+        catch {
+
+          Write-Host "Could not save PC state." -ForegroundColor Red
+          Write-Host $_.Exception.Message -ForegroundColor Red
+          exit 1
+        }
+
+        Write-Host "Detected applications:"
+
+        foreach ($application in $applications) {
+
+          $appName = [string]$application.Name
+          $appId = [string]$application.WingetId
+
+          Write-Host "$appName | WinGet ID: $appId"
+        }
+
+     
